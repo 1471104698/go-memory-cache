@@ -2,6 +2,7 @@ package main
 
 import (
 	"sync"
+	"time"
 )
 
 /*
@@ -9,6 +10,11 @@ import (
 	1、LRU
 	2、LFU
 */
+
+const (
+	LRU = 1
+	LFU = 2
+)
 
 type KeyMgr interface {
 	Get(key string) interface{}
@@ -19,15 +25,13 @@ type KeyMgr interface {
 type LRUNode struct {
 	key       string
 	val       interface{}
-	expire    int64
 	pre, next *LRUNode
 }
 
-func newLRUNode(key string, value interface{}, expire int64) *LRUNode {
+func newLRUNode(key string, value interface{}) *LRUNode {
 	return &LRUNode{
-		key:    key,
-		val:    value,
-		expire: expire,
+		key: key,
+		val: value,
 	}
 }
 
@@ -42,7 +46,8 @@ type LRUCache struct {
 	cap        int
 	size       int
 	head, tail *LRUNode
-	nodeMap    map[string]*LRUNode
+	nodeMap    map[string]*LRUNode // 存储所有 node
+	expireMap  map[string]int64    // 存储设置 key 对应的过期时间
 	lock       *sync.Mutex
 }
 
@@ -51,12 +56,13 @@ func LRUConstructor(capacity int) LRUCache {
 	head.next = tail
 	tail.pre = head
 	return LRUCache{
-		cap:     capacity,
-		size:    0,
-		head:    head,
-		tail:    tail,
-		nodeMap: map[string]*LRUNode{},
-		lock:    &sync.Mutex{},
+		cap:       capacity,
+		size:      0,
+		head:      head,
+		tail:      tail,
+		nodeMap:   map[string]*LRUNode{},
+		expireMap: map[string]int64{},
+		lock:      &sync.Mutex{},
 	}
 }
 
@@ -67,26 +73,34 @@ func (this *LRUCache) Get(key string) interface{} {
 	if node == nil {
 		return -1
 	}
+	// 判断是否过期，如果过期那么删除
+	if expire, ok := this.expireMap[key]; ok {
+		if expire > 0 && expire < time.Now().Unix() {
+			this.deleteAndClean(node)
+			return -1
+		}
+	}
 	moveToHead(this, node)
 	return node.val
 }
 
 func (this *LRUCache) Set(key string, value interface{}, expire int64) bool {
+
 	this.lock.Lock()
 	defer this.lock.Unlock()
 	// 从 map 中获取
 	node := this.nodeMap[key]
 	if node == nil {
-		node = newLRUNode(key, value, expire)
+		node = newLRUNode(key, value)
 		this.nodeMap[key] = node
 		removeNode := addNode(this, node)
-		if removeNode != nil {
-			this.nodeMap[removeNode.key] = nil
-			// delete(nodeMap, key)
-		}
+		this.deleteAndClean(removeNode)
 	} else {
 		node.val = value // 由于是指针，map 里也会更新
 		moveToHead(this, node)
+	}
+	if expire > 0 {
+		this.expireMap[key] = time.Now().Add(time.Second * time.Duration(expire)).Unix()
 	}
 	return true
 }
@@ -99,9 +113,17 @@ func (this *LRUCache) Delete(key string) bool {
 	if node == nil {
 		return true
 	}
+	this.deleteAndClean(node)
+	return true
+}
+
+func (this *LRUCache) deleteAndClean(node *LRUNode) {
+	if node == nil {
+		return
+	}
 	deleteNode(this, node)
 	delete(this.nodeMap, node.key)
-	return true
+	delete(this.expireMap, node.key)
 }
 
 func addNode(this *LRUCache, node *LRUNode) *LRUNode {
@@ -133,17 +155,20 @@ func removeTail(this *LRUCache) *LRUNode {
 	return node
 }
 
-func deleteNode(this *LRUCache, node *LRUNode) bool {
-	if node == nil {
-		return true
+func deleteNode(this *LRUCache, node *LRUNode) {
+	if node.pre == nil || node.next == nil {
+		return
 	}
 	node.pre.next = node.next
 	node.next.pre = node.pre
 	node.pre = nil
 	node.next = nil
 	this.size--
-	return true
 }
+
+// -------------------------------------------------------- LFU start -----------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------------------------------------------------------------------------------
 
 type LFUNode struct {
 	key       string
@@ -186,6 +211,9 @@ func (this *LinkedList) moveToHead(node *LFUNode) {
 }
 
 func (this *LinkedList) removeNode(removeNode *LFUNode) {
+	if removeNode.pre == nil || removeNode.next == nil {
+		return
+	}
 	removeNode.pre.next = removeNode.next
 	removeNode.next.pre = removeNode.pre
 	removeNode.pre = nil
@@ -266,6 +294,7 @@ type LFUCache struct {
 	nodeMap    map[string]*LFUNode // 存储 key-Node
 	timeMap    map[int]*LinkedList // 存储 time-list
 	times      *sortList           // 存储 key 的访问次数，是一个有序列表
+	expireMap  map[string]int64    // 存储设置 key 对应的过期时间
 	lock       *sync.Mutex
 }
 
@@ -274,12 +303,13 @@ func LFUConstructor(capacity int) LFUCache {
 	head.next = tail
 	tail.pre = head
 	return LFUCache{
-		cap:     capacity,
-		size:    0,
-		nodeMap: map[string]*LFUNode{},
-		timeMap: map[int]*LinkedList{},
-		times:   &sortList{},
-		lock:    &sync.Mutex{},
+		cap:       capacity,
+		size:      0,
+		nodeMap:   map[string]*LFUNode{},
+		timeMap:   map[int]*LinkedList{},
+		times:     &sortList{},
+		expireMap: map[string]int64{},
+		lock:      &sync.Mutex{},
 	}
 }
 
@@ -291,34 +321,25 @@ func (this *LFUCache) Get(key string) interface{} {
 	if node == nil {
 		return -1
 	}
-	// 获取 node 的访问次数 time
-	time := node.time
-	// 将 node 从当前 time list 中移除，同时判断当前 time list 是否已经为空，并且为空并且 time == minTime，那么将 minTime++
-	ll := this.timeMap[time]
-	ll.removeNode(node)
-	if ll.isEmpty() {
-		// 删除 time
-		this.times.delete(time)
-		delete(this.timeMap, time)
+	// 判断是否过期，如果过期那么删除
+	if expire, ok := this.expireMap[key]; ok {
+		if expire > 0 && expire < time.Now().Unix() {
+			this.deleteAndClean(node, true)
+			return -1
+		}
 	}
-	time++
-	// 将 node.time+1
-	node.time = time
-	// 记录 time
-	this.times.add(time)
-	// 将 node 添加到新的 list
-	newLL := this.timeMap[time]
-	if newLL == nil {
-		newLL = newLinkedList()
-		this.timeMap[time] = newLL
-	}
-	newLL.moveToHead(node)
+	this.deleteAndClean(node, false)
+	node.time++
+	this.addNewNode(node)
 	return node.val
 }
 
-func (this *LFUCache) Set(key string, value interface{}) bool {
+func (this *LFUCache) Set(key string, value interface{}, expire int64) bool {
 	if this.cap == 0 {
 		return false
+	}
+	if expire > 0 {
+		this.expireMap[key] = time.Now().Add(time.Second * time.Duration(expire)).Unix()
 	}
 	this.lock.Lock()
 	defer this.lock.Unlock()
@@ -331,14 +352,7 @@ func (this *LFUCache) Set(key string, value interface{}) bool {
 			ll := this.timeMap[minTime]
 			// 将节点从 nodeMap 删除
 			removeNode := ll.removeTail()
-			delete(this.nodeMap, removeNode.key)
-			// 再判断 list 是否为空，为空就去除
-			if ll.isEmpty() {
-				// 删除 time
-				this.times.delete(minTime)
-				// 删除 list
-				delete(this.timeMap, minTime)
-			}
+			this.deleteAndClean(removeNode, true)
 		} else {
 			this.size++
 		}
@@ -358,33 +372,10 @@ func (this *LFUCache) Set(key string, value interface{}) bool {
 		ll.moveToHead(node)
 		return true
 	}
-	// 更新 node.val
+	this.deleteAndClean(node, false)
 	node.val = value
-	// 获取 node 的访问次数 time
-	time := node.time
-	// 将 node 从当前 time list 中移除，同时判断当前 time list 是否已经为空，并且为空并且 time == minTime，那么将 minTime++
-	ll := this.timeMap[time]
-	ll.removeNode(node)
-	if ll.isEmpty() {
-		// 删除 time
-		this.times.delete(time)
-		// 删除 list
-		delete(this.timeMap, time)
-	}
-	// time+1
-	time++
-	// 更新 node time
-	node.time = time
-	// 记录 time
-	this.times.add(time)
-	// 将 node 添加到新的 list
-	newLL := this.timeMap[time]
-	if newLL == nil {
-		newLL = newLinkedList()
-		this.timeMap[time] = newLL
-	}
-	newLL.moveToHead(node)
-	return true
+	node.time++
+	return this.addNewNode(node)
 }
 
 func (this *LFUCache) Delete(key string) bool {
@@ -404,8 +395,18 @@ func (this *LFUCache) Delete(key string) bool {
 	if node == nil {
 		return true
 	}
-	delete(this.nodeMap, node.key)
+	this.deleteAndClean(node, true)
+	return true
+}
 
+func (this *LFUCache) deleteAndClean(node *LFUNode, isClean bool) {
+	if node == nil {
+		return
+	}
+	if isClean {
+		delete(this.nodeMap, node.key)
+		delete(this.expireMap, node.key)
+	}
 	time := node.time
 	// 根据 time 获取所在 list
 	ll := this.timeMap[time]
@@ -418,13 +419,23 @@ func (this *LFUCache) Delete(key string) bool {
 		// 删除 list
 		delete(this.timeMap, time)
 	}
+}
+
+func (this *LFUCache) addNewNode(node *LFUNode) bool {
+	// 更新 node.val
+	time := node.time
+	// 记录 time
+	this.times.add(time)
+	// 将 node 添加到新的 list
+	newLL := this.timeMap[time]
+	if newLL == nil {
+		newLL = newLinkedList()
+		this.timeMap[time] = newLL
+	}
+	newLL.moveToHead(node)
 	return true
 }
 
 func (this *LFUCache) getMinTime() int {
 	return this.times.getMin()
-}
-
-func main() {
-
 }
