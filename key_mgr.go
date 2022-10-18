@@ -11,15 +11,11 @@ import (
 	2、LFU
 */
 
-const (
-	LRU = 1
-	LFU = 2
-)
-
 type KeyMgr interface {
 	Get(key string) interface{}
-	Set(key string, value interface{}) bool
+	Set(key string, value interface{}, expire int64) bool
 	Delete(key string) bool
+	ScanAndDelete(keyPercent float64) // 扫描并删除过期 key
 }
 
 type LRUNode struct {
@@ -51,11 +47,11 @@ type LRUCache struct {
 	lock       *sync.Mutex
 }
 
-func LRUConstructor(capacity int) LRUCache {
+func LRUConstructor(capacity int) *LRUCache {
 	head, tail := emptyLRUNode(), emptyLRUNode()
 	head.next = tail
 	tail.pre = head
-	return LRUCache{
+	return &LRUCache{
 		cap:       capacity,
 		size:      0,
 		head:      head,
@@ -85,7 +81,12 @@ func (this *LRUCache) Get(key string) interface{} {
 }
 
 func (this *LRUCache) Set(key string, value interface{}, expire int64) bool {
-
+	if this.cap == 0 {
+		return true
+	}
+	if key == "" {
+		return false
+	}
 	this.lock.Lock()
 	defer this.lock.Unlock()
 	// 从 map 中获取
@@ -100,7 +101,7 @@ func (this *LRUCache) Set(key string, value interface{}, expire int64) bool {
 		moveToHead(this, node)
 	}
 	if expire > 0 {
-		this.expireMap[key] = time.Now().Add(time.Second * time.Duration(expire)).Unix()
+		this.expireMap[key] = getExpireTime(expire)
 	}
 	return true
 }
@@ -115,6 +116,30 @@ func (this *LRUCache) Delete(key string) bool {
 	}
 	this.deleteAndClean(node)
 	return true
+}
+
+func (this *LRUCache) ScanAndDelete(keyPercent float64) {
+	this.lock.Lock()
+	defer this.lock.Unlock()
+	keySize := int(float64(len(this.expireMap))*keyPercent) + 1
+	for keySize > 0 {
+		var deleteKey string
+		// 利用 for range 返回 key 的随机性来进行随机 key 的扫描
+		for key, expire := range this.expireMap {
+			if expire < time.Now().Unix() {
+				deleteKey = key
+				break
+			}
+		}
+		// 如果 key 不为空，那么进行删除，如果为空，那么表示不存在过期 key，直接返回
+		if deleteKey != "" {
+			node := this.nodeMap[deleteKey]
+			this.deleteAndClean(node)
+		} else {
+			break
+		}
+		keySize--
+	}
 }
 
 func (this *LRUCache) deleteAndClean(node *LRUNode) {
@@ -298,11 +323,11 @@ type LFUCache struct {
 	lock       *sync.Mutex
 }
 
-func LFUConstructor(capacity int) LFUCache {
+func LFUConstructor(capacity int) *LFUCache {
 	head, tail := &LFUNode{}, &LFUNode{}
 	head.next = tail
 	tail.pre = head
-	return LFUCache{
+	return &LFUCache{
 		cap:       capacity,
 		size:      0,
 		nodeMap:   map[string]*LFUNode{},
@@ -336,10 +361,13 @@ func (this *LFUCache) Get(key string) interface{} {
 
 func (this *LFUCache) Set(key string, value interface{}, expire int64) bool {
 	if this.cap == 0 {
+		return true
+	}
+	if key == "" {
 		return false
 	}
 	if expire > 0 {
-		this.expireMap[key] = time.Now().Add(time.Second * time.Duration(expire)).Unix()
+		this.expireMap[key] = getExpireTime(expire)
 	}
 	this.lock.Lock()
 	defer this.lock.Unlock()
@@ -399,6 +427,30 @@ func (this *LFUCache) Delete(key string) bool {
 	return true
 }
 
+func (this *LFUCache) ScanAndDelete(keyPercent float64) {
+	this.lock.Lock()
+	defer this.lock.Unlock()
+	keySize := int(float64(len(this.expireMap))*keyPercent) + 1
+	for keySize > 0 {
+		var deleteKey string
+		// 利用 for range 返回 key 的随机性来进行随机 key 的扫描
+		for key, expire := range this.expireMap {
+			if expire < time.Now().Unix() {
+				deleteKey = key
+				break
+			}
+		}
+		// 如果 key 不为空，那么进行删除，如果为空，那么表示不存在过期 key，直接返回
+		if deleteKey != "" {
+			node := this.nodeMap[deleteKey]
+			this.deleteAndClean(node, true)
+		} else {
+			break
+		}
+		keySize--
+	}
+}
+
 func (this *LFUCache) deleteAndClean(node *LFUNode, isClean bool) {
 	if node == nil {
 		return
@@ -438,4 +490,8 @@ func (this *LFUCache) addNewNode(node *LFUNode) bool {
 
 func (this *LFUCache) getMinTime() int {
 	return this.times.getMin()
+}
+
+func getExpireTime(expire int64) int64 {
+	return time.Now().Add(time.Second * time.Duration(expire)).Unix()
 }
